@@ -36,37 +36,64 @@ jobs:
           git clone --depth 1 --recurse-submodules -b v1.22.2 https://github.com/EmulatorJS/RetroArch.git RetroArch
           git clone --depth 1 https://github.com/AloysHF/NicaiEmu.git nicaiemu
 
+      - name: Patch libretro export names (rust -> emscripten 要带下划线前缀)
+        run: |
+          cd "$GITHUB_WORKSPACE/nicaiemu"
+          python3 - <<'PY'
+          import re, glob
+          n = 0
+          for f in glob.glob('crates/nicaiemu-libretro/src/**/*.rs', recursive=True):
+              s = open(f, encoding='utf-8').read()
+              t = re.sub(r'(#\[no_mangle\]\s*\n)(pub extern "C" fn )(retro_\w+)(\()',
+                         lambda m: m.group(1) + '#[export_name = "_' + m.group(3) + '"]\n' + m.group(2) + m.group(3) + m.group(4),
+                         s)
+              if t != s:
+                  open(f, 'w', encoding='utf-8').write(t)
+                  n += s.count('#[no_mangle]')
+                  print('patched:', f)
+          print('total export_name added:', n)
+          PY
+
       - name: Build Rust core as staticlib
         run: |
           source "$GITHUB_WORKSPACE/emsdk/emsdk_env.sh"
           export PATH="$HOME/.cargo/bin:$PATH"
-          cd nicaiemu
-          # libretro crate 默认是 cdylib，改成 staticlib 才能作为静态库链进 RetroArch 前端
+          cd "$GITHUB_WORKSPACE/nicaiemu"
           sed -i 's/crate-type = \["cdylib"\]/crate-type = ["staticlib"]/' crates/nicaiemu-libretro/Cargo.toml
           cargo build --release --target wasm32-unknown-emscripten -p nicaiemu-libretro
           ls -l target/wasm32-unknown-emscripten/release/*.a
           cp target/wasm32-unknown-emscripten/release/libnicaiemu.a "$GITHUB_WORKSPACE/RetroArch/libretro_emscripten.a"
 
-      - name: Link with RetroArch emscripten frontend
+      - name: Link normal (WebGL2) + legacy (WebGL1) variants
         run: |
           source "$GITHUB_WORKSPACE/emsdk/emsdk_env.sh"
           cd "$GITHUB_WORKSPACE/RetroArch/emulatorjs"
+          mkdir -p out-normal out-legacy
           emmake make -C ../ -f Makefile.emulatorjs \
             TARGET=nicaiemu_libretro.js \
             HAVE_7ZIP=1 HAVE_CHD=1 HAVE_THREADS=0 PTHREAD_POOL_SIZE=0 ASYNC=0 \
             HAVE_OPENGLES3=1 STACK_SIZE=4194304 INITIAL_HEAP=134217728 \
             HAVE_AL=0 HAVE_RWEBAUDIO=1 LIGHT_DEBUG=0 -j$(nproc)
-          ls -l ../nicaiemu_libretro.wasm ../nicaiemu_libretro.js
+          cp ../nicaiemu_libretro.wasm ../nicaiemu_libretro.js out-normal/
+          # OBJDIR 是固定的 obj-emscripten，不 clean 的话 legacy 会复用 GLES3 的 .o 串味
+          emmake make -C ../ -f Makefile.emulatorjs clean
+          emmake make -C ../ -f Makefile.emulatorjs \
+            TARGET=nicaiemu_libretro.js \
+            HAVE_7ZIP=1 HAVE_CHD=1 HAVE_THREADS=0 PTHREAD_POOL_SIZE=0 ASYNC=0 \
+            HAVE_OPENGLES3=0 STACK_SIZE=4194304 INITIAL_HEAP=134217728 \
+            HAVE_AL=0 HAVE_RWEBAUDIO=1 LIGHT_DEBUG=0 -j$(nproc)
+          cp ../nicaiemu_libretro.wasm ../nicaiemu_libretro.js out-legacy/
 
-      - name: Pack 7z core (nicaiemu-wasm.data)
+      - name: Pack both 7z cores
         run: |
           cd "$GITHUB_WORKSPACE/RetroArch/emulatorjs"
           mkdir -p out
           printf '%s' '{"name":"nicaiemu","extensions":["cbe"],"options":{},"save":"srm","license":"LICENSE","repo":"https://github.com/AloysHF/NicaiEmu"}' > core.json
           printf '%s' '{"minimumEJSVersion":"4.2.2","version":"0.1.0"}' > build.json
-          printf '%s' '{"core":"nicaiemu","buildStart":"ci","buildEnd":"ci","options":{}}' > reports.json
-          7z a -t7z out/nicaiemu-wasm.data ../nicaiemu_libretro.wasm ../nicaiemu_libretro.js core.json build.json
-          cp reports.json out/nicaiemu-report.json
+          printf '%s' '{"core":"nicaiemu","buildStart":"ci","buildEnd":"ci","options":{}}' > out/nicaiemu-report.json
+          7z a -t7z out/nicaiemu-wasm.data ./out-normal/* core.json build.json
+          7z a -t7z out/nicaiemu-legacy-wasm.data ./out-legacy/* core.json build.json
+          ls -l out/
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -74,4 +101,5 @@ jobs:
           name: nicaiemu-core
           path: |
             RetroArch/emulatorjs/out/nicaiemu-wasm.data
+            RetroArch/emulatorjs/out/nicaiemu-legacy-wasm.data
             RetroArch/emulatorjs/out/nicaiemu-report.json
