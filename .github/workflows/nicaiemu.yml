@@ -36,65 +36,94 @@ jobs:
           git clone --depth 1 --recurse-submodules -b v1.22.2 https://github.com/EmulatorJS/RetroArch.git RetroArch
           git clone --depth 1 https://github.com/AloysHF/NicaiEmu.git nicaiemu
 
-      - name: Build Rust core as staticlib (with debug info)
+      - name: Patch nicaiemu for emscripten
+        run: |
+          cd "$GITHUB_WORKSPACE/nicaiemu"
+          # 1) cdylib -> staticlib，才能作为静态库链进 RetroArch 前端
+          sed -i 's/crate-type = \["cdylib"\]/crate-type = ["staticlib"]/' crates/nicaiemu-libretro/Cargo.toml
+          # 2) 关键修复：前端提供的 retro_log_printf_t 在 libretro.h 里是 C 变参函数
+          #    void (*)(enum retro_log_level, const char *fmt, ...)
+          #    Rust 无法用固定参数签名调用它，wasm 会在 call_indirect 处
+          #    "null function or function signature mismatch" 直接 trap
+          #    （实测崩在 retro_init -> LibretroLogger::log 的第一条日志上）。
+          #    这里不再采用前端的 logger，保留 fallback_log（eprintln -> stderr -> 浏览器控制台）。
+          python3 - <<'PY'
+          p = 'crates/nicaiemu-libretro/src/libretro/callbacks.rs'
+          s = open(p, encoding='utf-8').read()
+          old = """            if success {
+                CALLBACKS.log = Some(log_cb.log);
+            }"""
+          new = """            // wasm 修复：不要采用前端的 retro_log_printf_t（C 变参函数），
+            // 固定参数签名调用会触发 wasm call_indirect 签名不匹配。
+            let _ = success;
+            let _ = &mut log_cb;"""
+          assert old in s, 'callbacks.rs patch anchor not found'
+          open(p, 'w', encoding='utf-8').write(s.replace(old, new))
+          print('patched callbacks.rs: frontend variadic logger disabled')
+          PY
+          grep -n "let _ = success;" crates/nicaiemu-libretro/src/libretro/callbacks.rs
+
+      - name: Build Rust core as staticlib
         run: |
           source "$GITHUB_WORKSPACE/emsdk/emsdk_env.sh"
           export PATH="$HOME/.cargo/bin:$PATH"
           cd "$GITHUB_WORKSPACE/nicaiemu"
-          sed -i 's/crate-type = \["cdylib"\]/crate-type = ["staticlib"]/' crates/nicaiemu-libretro/Cargo.toml
-          sed -i 's/^strip = true/strip = "none"/' Cargo.toml
-          grep -n "strip" Cargo.toml
-          export CARGO_PROFILE_RELEASE_DEBUG=2
           cargo build --release --target wasm32-unknown-emscripten -p nicaiemu-libretro
           ls -l target/wasm32-unknown-emscripten/release/libnicaiemu.a
           cp target/wasm32-unknown-emscripten/release/libnicaiemu.a "$GITHUB_WORKSPACE/RetroArch/libretro_emscripten.a"
-          {
-            echo "--- archive members ---"
-            ar t "$GITHUB_WORKSPACE/RetroArch/libretro_emscripten.a" | wc -l
-            echo "--- retro_ symbols in archive ---"
-            nm --defined-only "$GITHUB_WORKSPACE/RetroArch/libretro_emscripten.a" 2>/dev/null | grep -c " T retro_" || true
-            nm --defined-only "$GITHUB_WORKSPACE/RetroArch/libretro_emscripten.a" 2>/dev/null | grep " T retro_" | head -40 || true
-          } | tee "$GITHUB_WORKSPACE/rust-info.txt"
 
-      - name: Link with RetroArch emscripten frontend (debug)
+      - name: Link normal + legacy variants
         run: |
           set -o pipefail
           source "$GITHUB_WORKSPACE/emsdk/emsdk_env.sh"
           cd "$GITHUB_WORKSPACE/RetroArch/emulatorjs"
-          mkdir -p out
+          mkdir -p out-normal out-legacy
+          # normal: WebGL2 / GLES3
           emmake make -C ../ -f Makefile.emulatorjs \
             TARGET=nicaiemu_libretro.js \
             HAVE_7ZIP=1 HAVE_CHD=1 HAVE_THREADS=0 PTHREAD_POOL_SIZE=0 ASYNC=0 \
             HAVE_OPENGLES3=1 STACK_SIZE=4194304 INITIAL_HEAP=134217728 \
-            HAVE_AL=0 HAVE_RWEBAUDIO=1 LIGHT_DEBUG=1 V=1 -j$(nproc) 2>&1 | tee "$GITHUB_WORKSPACE/link.log" | tail -60
-          ls -l ../nicaiemu_libretro.wasm ../nicaiemu_libretro.js
+            HAVE_AL=0 HAVE_RWEBAUDIO=1 LIGHT_DEBUG=0 -j$(nproc)
+          cp ../nicaiemu_libretro.wasm ../nicaiemu_libretro.js out-normal/
+          # legacy: WebGL1 / GLES2（make clean 必须做，OBJDIR 固定）
+          emmake make -C ../ -f Makefile.emulatorjs clean
+          emmake make -C ../ -f Makefile.emulatorjs \
+            TARGET=nicaiemu_libretro.js \
+            HAVE_7ZIP=1 HAVE_CHD=1 HAVE_THREADS=0 PTHREAD_POOL_SIZE=0 ASYNC=0 \
+            HAVE_OPENGLES3=0 STACK_SIZE=4194304 INITIAL_HEAP=134217728 \
+            HAVE_AL=0 HAVE_RWEBAUDIO=1 LIGHT_DEBUG=0 -j$(nproc)
+          cp ../nicaiemu_libretro.wasm ../nicaiemu_libretro.js out-legacy/
+          ls -l out-normal out-legacy
 
-      - name: Verify symbols and pack 7z core
+      - name: Verify and pack 7z cores
         run: |
           cd "$GITHUB_WORKSPACE/RetroArch/emulatorjs"
           {
-            echo "wasm bytes : $(stat -c %s ../nicaiemu_libretro.wasm)"
-            echo "js bytes   : $(stat -c %s ../nicaiemu_libretro.js)"
-            echo "wasm sha256: $(sha256sum ../nicaiemu_libretro.wasm | cut -d' ' -f1)"
-            echo "strings retro_run  : $(grep -ac 'retro_run' ../nicaiemu_libretro.wasm || true)"
-            echo "strings retro_init : $(grep -ac 'retro_init' ../nicaiemu_libretro.wasm || true)"
-            echo "strings NicaiEmu   : $(grep -ac 'NicaiEmu' ../nicaiemu_libretro.wasm || true)"
+            echo "normal wasm bytes : $(stat -c %s out-normal/nicaiemu_libretro.wasm)"
+            echo "legacy wasm bytes : $(stat -c %s out-legacy/nicaiemu_libretro.wasm)"
+            echo "normal js bytes   : $(stat -c %s out-normal/nicaiemu_libretro.js)"
+            echo "core linked (NicaiEmu string present): $(grep -ac 'NicaiEmu' out-normal/nicaiemu_libretro.wasm || true)"
           } | tee build-info.txt
-          mkdir -p out
+          N=$(stat -c %s out-normal/nicaiemu_libretro.wasm)
+          if [ "$N" -lt 4000000 ]; then echo "ERROR: core 没链进去（wasm 只有 $N 字节）"; exit 1; fi
           printf '%s' '{"name":"nicaiemu","extensions":["cbe"],"options":{},"save":"srm","license":"LICENSE","repo":"https://github.com/AloysHF/NicaiEmu"}' > core.json
           printf '%s' '{"minimumEJSVersion":"4.2.2","version":"0.1.0"}' > build.json
+          mkdir -p out
           printf '%s' '{"core":"nicaiemu","buildStart":"ci","buildEnd":"ci","options":{"defaultWebGL2":true}}' > out/nicaiemu-report.json
-          7z a -t7z out/nicaiemu-wasm.data ../nicaiemu_libretro.wasm ../nicaiemu_libretro.js core.json build.json
+          cp core.json build.json out-normal/
+          cp core.json build.json out-legacy/
+          ( cd out-normal && 7z a -t7z ../out/nicaiemu-wasm.data nicaiemu_libretro.wasm nicaiemu_libretro.js core.json build.json )
+          ( cd out-legacy && 7z a -t7z ../out/nicaiemu-legacy-wasm.data nicaiemu_libretro.wasm nicaiemu_libretro.js core.json build.json )
           cp build-info.txt out/
+          echo "--- out ---"
           ls -l out/
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: nicaiemu-debug
+          name: nicaiemu-core
           path: |
             RetroArch/emulatorjs/out/nicaiemu-wasm.data
+            RetroArch/emulatorjs/out/nicaiemu-legacy-wasm.data
             RetroArch/emulatorjs/out/nicaiemu-report.json
             RetroArch/emulatorjs/out/build-info.txt
-            rust-info.txt
-            link.log
