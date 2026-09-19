@@ -41,27 +41,17 @@ jobs:
           cd "$GITHUB_WORKSPACE/nicaiemu"
           # 1) cdylib -> staticlib，才能作为静态库链进 RetroArch 前端
           sed -i 's/crate-type = \["cdylib"\]/crate-type = ["staticlib"]/' crates/nicaiemu-libretro/Cargo.toml
+          grep -n 'staticlib' crates/nicaiemu-libretro/Cargo.toml
           # 2) 关键修复：前端提供的 retro_log_printf_t 在 libretro.h 里是 C 变参函数
           #    void (*)(enum retro_log_level, const char *fmt, ...)
-          #    Rust 无法用固定参数签名调用它，wasm 会在 call_indirect 处
-          #    "null function or function signature mismatch" 直接 trap
-          #    （实测崩在 retro_init -> LibretroLogger::log 的第一条日志上）。
-          #    这里不再采用前端的 logger，保留 fallback_log（eprintln -> stderr -> 浏览器控制台）。
-          python3 - <<'PY'
-          p = 'crates/nicaiemu-libretro/src/libretro/callbacks.rs'
-          s = open(p, encoding='utf-8').read()
-          old = """            if success {
-                CALLBACKS.log = Some(log_cb.log);
-            }"""
-          new = """            // wasm 修复：不要采用前端的 retro_log_printf_t（C 变参函数），
-            // 固定参数签名调用会触发 wasm call_indirect 签名不匹配。
-            let _ = success;
-            let _ = &mut log_cb;"""
-          assert old in s, 'callbacks.rs patch anchor not found'
-          open(p, 'w', encoding='utf-8').write(s.replace(old, new))
-          print('patched callbacks.rs: frontend variadic logger disabled')
-          PY
-          grep -n "let _ = success;" crates/nicaiemu-libretro/src/libretro/callbacks.rs
+          #    Rust 无法用固定参数签名调用它，wasm 会在 call_indirect 处报
+          #    "null function or function signature mismatch" 直接 trap。
+          #    实测崩在 retro_init -> LibretroLogger::log 的第一条日志上。
+          #    这里不再采用前端的 logger，保留 init_log 里已设好的 fallback_log
+          #    （eprintln -> stderr -> 浏览器控制台）。
+          CB=crates/nicaiemu-libretro/src/libretro/callbacks.rs
+          sed -i 's|CALLBACKS\.log = Some(log_cb\.log);|/* patched(wasm): frontend retro_log_printf_t is variadic (level, fmt, ...); calling it with a fixed 2-arg Rust signature traps the wasm call_indirect. Keep fallback_log. */|' "$CB"
+          grep -n 'patched(wasm)' "$CB"
 
       - name: Build Rust core as staticlib
         run: |
