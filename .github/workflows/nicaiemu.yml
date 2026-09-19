@@ -36,7 +36,7 @@ jobs:
           git clone --depth 1 --recurse-submodules -b v1.22.2 https://github.com/EmulatorJS/RetroArch.git RetroArch
           git clone --depth 1 https://github.com/AloysHF/NicaiEmu.git nicaiemu
 
-      - name: Patch libretro export names (rust -> emscripten 要带下划线前缀)
+      - name: Patch libretro export names (rust -> emscripten 需要下划线前缀)
         run: |
           cd "$GITHUB_WORKSPACE/nicaiemu"
           python3 - <<'PY'
@@ -49,50 +49,71 @@ jobs:
                          s)
               if t != s:
                   open(f, 'w', encoding='utf-8').write(t)
-                  n += s.count('#[no_mangle]')
-                  print('patched:', f)
-          print('total export_name added:', n)
+                  n += len(re.findall(r'#\[export_name', t))
+          print('export_name added:', n)
           PY
 
-      - name: Build Rust core as staticlib
+      - name: Build Rust core and unpack objects
         run: |
           source "$GITHUB_WORKSPACE/emsdk/emsdk_env.sh"
           export PATH="$HOME/.cargo/bin:$PATH"
           cd "$GITHUB_WORKSPACE/nicaiemu"
           sed -i 's/crate-type = \["cdylib"\]/crate-type = ["staticlib"]/' crates/nicaiemu-libretro/Cargo.toml
           cargo build --release --target wasm32-unknown-emscripten -p nicaiemu-libretro
-          ls -l target/wasm32-unknown-emscripten/release/*.a
-          cp target/wasm32-unknown-emscripten/release/libnicaiemu.a "$GITHUB_WORKSPACE/RetroArch/libretro_emscripten.a"
+          A="$GITHUB_WORKSPACE/nicaiemu/target/wasm32-unknown-emscripten/release/libnicaiemu.a"
+          ls -l "$A"
+          mkdir -p /tmp/rustobjs && cd /tmp/rustobjs
+          i=0
+          for m in $(ar t "$A"); do
+            i=$((i+1))
+            ar p "$A" "$m" > "$(printf '%04d' $i)_$(basename "$m")"
+          done
+          echo "object count: $(ls -1 | wc -l)"
+          ls -l | head -4
+          file "$(ls | head -1)"
+          ar rcs "$GITHUB_WORKSPACE/RetroArch/libretro_emscripten.a"
 
-      - name: Link normal (WebGL2) + legacy (WebGL1) variants
+      - name: Link normal + legacy variants
         run: |
           source "$GITHUB_WORKSPACE/emsdk/emsdk_env.sh"
+          OBJS=$(ls /tmp/rustobjs/* | tr '\n' ' ')
           cd "$GITHUB_WORKSPACE/RetroArch/emulatorjs"
           mkdir -p out-normal out-legacy
           emmake make -C ../ -f Makefile.emulatorjs \
             TARGET=nicaiemu_libretro.js \
             HAVE_7ZIP=1 HAVE_CHD=1 HAVE_THREADS=0 PTHREAD_POOL_SIZE=0 ASYNC=0 \
             HAVE_OPENGLES3=1 STACK_SIZE=4194304 INITIAL_HEAP=134217728 \
-            HAVE_AL=0 HAVE_RWEBAUDIO=1 LIGHT_DEBUG=0 -j$(nproc)
+            HAVE_AL=0 HAVE_RWEBAUDIO=1 LIGHT_DEBUG=0 \
+            additional_libs="$OBJS" -j$(nproc)
+          ls -l ../nicaiemu_libretro.wasm
           cp ../nicaiemu_libretro.wasm ../nicaiemu_libretro.js out-normal/
-          # OBJDIR 是固定的 obj-emscripten，不 clean 的话 legacy 会复用 GLES3 的 .o 串味
           emmake make -C ../ -f Makefile.emulatorjs clean
           emmake make -C ../ -f Makefile.emulatorjs \
             TARGET=nicaiemu_libretro.js \
             HAVE_7ZIP=1 HAVE_CHD=1 HAVE_THREADS=0 PTHREAD_POOL_SIZE=0 ASYNC=0 \
             HAVE_OPENGLES3=0 STACK_SIZE=4194304 INITIAL_HEAP=134217728 \
-            HAVE_AL=0 HAVE_RWEBAUDIO=1 LIGHT_DEBUG=0 -j$(nproc)
+            HAVE_AL=0 HAVE_RWEBAUDIO=1 LIGHT_DEBUG=0 \
+            additional_libs="$OBJS" -j$(nproc)
+          ls -l ../nicaiemu_libretro.wasm
           cp ../nicaiemu_libretro.wasm ../nicaiemu_libretro.js out-legacy/
 
-      - name: Pack both 7z cores
+      - name: Verify symbols and pack 7z cores
         run: |
           cd "$GITHUB_WORKSPACE/RetroArch/emulatorjs"
+          {
+            echo "normal wasm bytes : $(stat -c %s out-normal/nicaiemu_libretro.wasm)"
+            echo "legacy wasm bytes : $(stat -c %s out-legacy/nicaiemu_libretro.wasm)"
+            echo "normal _retro_run : $(grep -ac '_retro_run' out-normal/nicaiemu_libretro.wasm || true)"
+            echo "normal _retro_init : $(grep -ac '_retro_init' out-normal/nicaiemu_libretro.wasm || true)"
+            echo "normal _retro_load_game : $(grep -ac '_retro_load_game' out-normal/nicaiemu_libretro.wasm || true)"
+          } | tee build-info.txt
           mkdir -p out
           printf '%s' '{"name":"nicaiemu","extensions":["cbe"],"options":{},"save":"srm","license":"LICENSE","repo":"https://github.com/AloysHF/NicaiEmu"}' > core.json
           printf '%s' '{"minimumEJSVersion":"4.2.2","version":"0.1.0"}' > build.json
           printf '%s' '{"core":"nicaiemu","buildStart":"ci","buildEnd":"ci","options":{}}' > out/nicaiemu-report.json
-          7z a -t7z out/nicaiemu-wasm.data ./out-normal/* core.json build.json
-          7z a -t7z out/nicaiemu-legacy-wasm.data ./out-legacy/* core.json build.json
+          ( cd out-normal && 7z a -t7z ../out/nicaiemu-wasm.data ./* ../core.json ../build.json )
+          ( cd out-legacy && 7z a -t7z ../out/nicaiemu-legacy-wasm.data ./* ../core.json ../build.json )
+          cp build-info.txt out/
           ls -l out/
 
       - name: Upload artifact
@@ -103,3 +124,4 @@ jobs:
             RetroArch/emulatorjs/out/nicaiemu-wasm.data
             RetroArch/emulatorjs/out/nicaiemu-legacy-wasm.data
             RetroArch/emulatorjs/out/nicaiemu-report.json
+            RetroArch/emulatorjs/out/build-info.txt
