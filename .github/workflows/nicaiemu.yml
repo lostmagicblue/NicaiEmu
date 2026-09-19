@@ -1,0 +1,77 @@
+name: Build nicaiemu core (CBE)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y p7zip-full build-essential pkgconf python3 git zip curl patch cmake
+
+      - name: Install Emscripten 3.1.74
+        run: |
+          git clone https://github.com/emscripten-core/emsdk.git
+          cd emsdk
+          ./emsdk install 3.1.74
+          ./emsdk activate 3.1.74
+
+      - name: Install Rust + emscripten target
+        run: |
+          curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable --profile minimal
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          rustup target add wasm32-unknown-emscripten
+
+      - name: Fetch sources
+        run: |
+          git clone --depth 1 --recurse-submodules -b v1.22.2 https://github.com/EmulatorJS/RetroArch.git RetroArch
+          git clone --depth 1 https://github.com/AloysHF/NicaiEmu.git nicaiemu
+
+      - name: Build Rust core as staticlib
+        run: |
+          source "$GITHUB_WORKSPACE/emsdk/emsdk_env.sh"
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cd nicaiemu
+          # libretro crate 默认是 cdylib，改成 staticlib 才能作为静态库链进 RetroArch 前端
+          sed -i 's/crate-type = \["cdylib"\]/crate-type = ["staticlib"]/' crates/nicaiemu-libretro/Cargo.toml
+          cargo build --release --target wasm32-unknown-emscripten -p nicaiemu-libretro
+          ls -l target/wasm32-unknown-emscripten/release/*.a
+          cp target/wasm32-unknown-emscripten/release/libnicaiemu.a "$GITHUB_WORKSPACE/RetroArch/libretro_emscripten.a"
+
+      - name: Link with RetroArch emscripten frontend
+        run: |
+          source "$GITHUB_WORKSPACE/emsdk/emsdk_env.sh"
+          cd "$GITHUB_WORKSPACE/RetroArch/emulatorjs"
+          emmake make -C ../ -f Makefile.emulatorjs \
+            TARGET=nicaiemu_libretro.js \
+            HAVE_7ZIP=1 HAVE_CHD=1 HAVE_THREADS=0 PTHREAD_POOL_SIZE=0 ASYNC=0 \
+            HAVE_OPENGLES3=1 STACK_SIZE=4194304 INITIAL_HEAP=134217728 \
+            HAVE_AL=0 HAVE_RWEBAUDIO=1 LIGHT_DEBUG=0 -j$(nproc)
+          ls -l ../nicaiemu_libretro.wasm ../nicaiemu_libretro.js
+
+      - name: Pack 7z core (nicaiemu-wasm.data)
+        run: |
+          cd "$GITHUB_WORKSPACE/RetroArch/emulatorjs"
+          mkdir -p out
+          printf '%s' '{"name":"nicaiemu","extensions":["cbe"],"options":{},"save":"srm","license":"LICENSE","repo":"https://github.com/AloysHF/NicaiEmu"}' > core.json
+          printf '%s' '{"minimumEJSVersion":"4.2.2","version":"0.1.0"}' > build.json
+          printf '%s' '{"core":"nicaiemu","buildStart":"ci","buildEnd":"ci","options":{}}' > reports.json
+          7z a -t7z out/nicaiemu-wasm.data ../nicaiemu_libretro.wasm ../nicaiemu_libretro.js core.json build.json
+          cp reports.json out/nicaiemu-report.json
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nicaiemu-core
+          path: |
+            RetroArch/emulatorjs/out/nicaiemu-wasm.data
+            RetroArch/emulatorjs/out/nicaiemu-report.json
