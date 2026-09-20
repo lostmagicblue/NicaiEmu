@@ -15,6 +15,10 @@ pub mod machine;
 pub mod rotation_profile;
 pub mod save_state;
 
+// 内置「同目录依赖文件」（付费组件等），由虚拟文件系统在 open() 时兜底命中。
+// 只放原机内容目录里真实存在的文件，详见该模块头部注释。
+mod builtin_files;
+
 // Experimental scene-level HLE runtime. Kept crate-internal for now: it is
 // not wired to any frontend, which executes guest code through NicaiMachine.
 mod runtime;
