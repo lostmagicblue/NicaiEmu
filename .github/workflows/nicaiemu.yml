@@ -36,7 +36,16 @@ name: Build nicaiemu core (CBE)
 #      改成构建时间戳，并额外产出 out/reports/nicaiemu.json（站点真正请求的路径）。
 
 on:
+  # 手动触发（有 Actions:write 权限的 Token 才能调；网页上点 Run workflow 也行）
   workflow_dispatch:
+  # 2026-09-20 新增：**改了核心源码或本工作流就自动重编**。
+  # 好处：重编核心不再需要「点按钮 / 调 dispatch 接口」——推上去就自己跑。
+  # 用 paths 限定范围，免得改个文档也重编（一次要 10 分钟）。
+  push:
+    paths:
+      - 'crates/nicaiemu-core/**'
+      - 'crates/nicaiemu-libretro/**'
+      - '.github/workflows/nicaiemu.yml'
 
 permissions:
   contents: read
