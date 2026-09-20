@@ -47,17 +47,7 @@ impl NicaiMachine {
                 );
                 self.set_result(SCREEN_IMAGE);
             }
-            5 => {
-                let arg0 = self.register(0);
-                let result = if arg0 == 0 { 8 } else { 16 };
-                // ⚠️ 临时诊断（2026-09-20，诊断完删）：
-                // 游戏逐字符问字宽时，这里只看 arg0 == 0 就返回 8/16，**没有解码真正的字符**。
-                // 怀疑它和索引 7（整串测宽）、以及 draw_text 的实际推进量对不上 →
-                // 中文对话框会溢出屏幕（实测「系统库已有更新版本，是否更新」右边被截）。
-                // 先把游戏真实传的参数记下来，再决定怎么改。
-                warn!("[lcd#5] arg0={arg0:#x} -> {result}");
-                self.set_result(result)
-            }
+            5 => self.set_result(if self.register(0) == 0 { 8 } else { 16 }),
             6 => self.set_result(16),
             7 => {
                 let bytes = self.read_c_bytes(self.register(0), 4096);
@@ -70,7 +60,6 @@ impl NicaiMachine {
                             .unwrap_or(16)
                     })
                     .sum();
-                warn!("[lcd#7] {text:?} -> {width}");
                 self.set_result(width);
             }
             9 => {
