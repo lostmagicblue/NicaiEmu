@@ -1,5 +1,22 @@
 name: Build nicaiemu core (CBE)
 
+# v9（2026-09-20）—— 目标：去掉核心 wasm 里的 WASM 异常处理（EH）指令
+#
+# 为什么：线上核心（run #6 产物）带 EH 指令，Chromium < 95 的 WebView 上
+#   WebAssembly.instantiate 直接抛 CompileError（Invalid opcode 0x6）→ EJS「无法开始游戏」。
+#   模拟器/老真机的系统 WebView 是 91 → 必中招；桌面 Chromium 正常。
+#   Rust 官方文档：wasm32-unknown-emscripten 默认开 -fwasm-exceptions，除非 -Cpanic=abort。
+#
+# 与 master 上原版（v7 系）的差异**只有 Rust 构建这一处**：加 RUSTFLAGS=-Cpanic=abort，
+# 并且并行跑两个变体（一次 dispatch 拿到两个核，谁的产物没 EH 就用谁）：
+#   · abort    = stable 工具链，只给业务 crate 加 -Cpanic=abort。
+#                预编译 std 仍是 panic=unwind，可能仍带 EH（EH 指令若来自 std 就救不了）。
+#   · buildstd = nightly + -Zbuild-std=std,panic_abort，连 std 一起重编（更彻底，也满足
+#                Rust 文档要求的「std 与本地 emcc 的 ABI 要匹配」）。
+#   其余步骤（emsdk 3.1.74 / RetroArch v1.22.2 / 两处 Rust 补丁 / 7z 打包）与原版逐字一致。
+#
+# ⚠️ CI 里无法直接判定「EH 到底去掉没有」→ 判据是产物装到模拟器（WebView 91）上能不能跑。
+
 on:
   workflow_dispatch:
 
@@ -8,7 +25,20 @@ permissions:
 
 jobs:
   build:
+    name: core (${{ matrix.variant }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: abort
+            toolchain: stable
+            cargo_cmd: cargo build --release --target wasm32-unknown-emscripten -p nicaiemu-libretro
+          - variant: buildstd
+            toolchain: nightly
+            cargo_cmd: cargo +nightly -Zbuild-std=std,panic_abort build --release --target wasm32-unknown-emscripten -p nicaiemu-libretro
+    env:
+      RUSTFLAGS: -Cpanic=abort
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -30,6 +60,8 @@ jobs:
           curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable --profile minimal
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           rustup target add wasm32-unknown-emscripten
+          rustup toolchain install ${{ matrix.toolchain }} --profile minimal --component rust-src
+          rustup target add wasm32-unknown-emscripten --toolchain ${{ matrix.toolchain }}
 
       - name: Fetch sources
         run: |
@@ -53,12 +85,15 @@ jobs:
           sed -i 's|CALLBACKS\.log = Some(log_cb\.log);|/* patched(wasm): frontend retro_log_printf_t is variadic (level, fmt, ...); calling it with a fixed 2-arg Rust signature traps the wasm call_indirect. Keep fallback_log. */|' "$CB"
           grep -n 'patched(wasm)' "$CB"
 
-      - name: Build Rust core as staticlib
+      - name: Build Rust core as staticlib (${{ matrix.variant }})
         run: |
           source "$GITHUB_WORKSPACE/emsdk/emsdk_env.sh"
           export PATH="$HOME/.cargo/bin:$PATH"
           cd "$GITHUB_WORKSPACE/nicaiemu"
-          cargo build --release --target wasm32-unknown-emscripten -p nicaiemu-libretro
+          echo "variant   = ${{ matrix.variant }}"
+          echo "toolchain = ${{ matrix.toolchain }}"
+          echo "RUSTFLAGS = $RUSTFLAGS   （必须是 -Cpanic=abort：它就是关掉 -fwasm-exceptions 的开关）"
+          ${{ matrix.cargo_cmd }}
           ls -l target/wasm32-unknown-emscripten/release/libnicaiemu.a
           cp target/wasm32-unknown-emscripten/release/libnicaiemu.a "$GITHUB_WORKSPACE/RetroArch/libretro_emscripten.a"
 
@@ -89,6 +124,9 @@ jobs:
         run: |
           cd "$GITHUB_WORKSPACE/RetroArch/emulatorjs"
           {
+            echo "variant           : ${{ matrix.variant }}"
+            echo "toolchain         : ${{ matrix.toolchain }}"
+            echo "RUSTFLAGS         : $RUSTFLAGS"
             echo "normal wasm bytes : $(stat -c %s out-normal/nicaiemu_libretro.wasm)"
             echo "legacy wasm bytes : $(stat -c %s out-legacy/nicaiemu_libretro.wasm)"
             echo "normal js bytes   : $(stat -c %s out-normal/nicaiemu_libretro.js)"
@@ -111,7 +149,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: nicaiemu-core
+          name: nicaiemu-core-${{ matrix.variant }}
           path: |
             RetroArch/emulatorjs/out/nicaiemu-wasm.data
             RetroArch/emulatorjs/out/nicaiemu-legacy-wasm.data
