@@ -25,6 +25,15 @@ name: Build nicaiemu core (CBE)
 #   2) 新增 "Verify no WASM EH" 步骤：用 wabt 在 CI 里直接判定 EH 是否为 0，
 #      EH 还在就直接 fail（不再依赖「装到设备上试」才知道）。
 #   其余步骤（emsdk 3.1.74 / RetroArch v1.22.2 / 两处 Rust 补丁 / 7z 打包）逐字沿用。
+#
+# 【v10.1（2026-09-20 下午）—— 为了能改核心源码】
+#   3) 源码改成 **checkout 本仓库**（本仓库就是 AloysHF/NicaiEmu 的 fork），
+#      不再 clone 上游 —— 因为要改核心源码（内置付费组件），而上游我们推不上去。
+#   4) 新增 "Fetch built-in component files (CBM)" 步骤：从站点取
+#      `WpayKer42V100.CBM` 喂给 crates/nicaiemu-core/assets/ 供 include_bytes!，
+#      并做 md5 校验（换组件时记得同步改 md5）。
+#   5) buildStart 不再写死 "ci"（原来那样换核后所有老用户永远跑旧核）：
+#      改成构建时间戳，并额外产出 out/reports/nicaiemu.json（站点真正请求的路径）。
 
 on:
   workflow_dispatch:
@@ -41,8 +50,14 @@ jobs:
       # 配合下面的 -Zbuild-std，std 也一起用 panic_abort 重编，EH 才会真正消失。
       RUSTFLAGS: -Cpanic=abort
     steps:
-      - name: Checkout
+      # ⚠️ 2026-09-20 改：源码**从本仓库取**（本仓库就是 AloysHF/NicaiEmu 的 fork），
+      #   不再 `git clone https://github.com/AloysHF/NicaiEmu.git` —— 因为我们要改核心源码
+      #   （内置付费组件，见 crates/nicaiemu-core/src/builtin_files.rs），
+      #   而那个上游仓库我们推不上去。checkout 到 nicaiemu/ 子目录，下面的路径都不变。
+      - name: Checkout core sources (this repo)
         uses: actions/checkout@v4
+        with:
+          path: nicaiemu
 
       - name: Install system packages
         run: |
@@ -64,10 +79,25 @@ jobs:
           rustup toolchain install nightly --profile minimal --component rust-src
           rustup target add wasm32-unknown-emscripten --toolchain nightly
 
-      - name: Fetch sources
+      # 内置「同目录依赖文件」：原机的游戏是从**游戏自己所在目录**按文件名读同目录文件的
+      # （名字明文写在 .CBE 里），线上核没有这个目录，所以把真组件编进 wasm。
+      # 文件放在站点上（`_emu_push/cbe/components/`），这里取下来喂给 include_bytes!。
+      # ⚠️ 以后换/加组件：改站点那份文件，并把下面的 md5 一起改掉。
+      - name: Fetch built-in component files (CBM)
+        run: |
+          set -e
+          DEST="$GITHUB_WORKSPACE/nicaiemu/crates/nicaiemu-core/assets"
+          mkdir -p "$DEST"
+          cd "$DEST"
+          curl -fsSL -o WpayKer42V100.CBM \
+            "https://emu.magicblue.cn/cbe/components/WpayKer42V100.CBM"
+          # 取到的必须和站点上那份一致（防截断/防拿到错误文件）
+          echo "8f7d757bc82d4a56d81e58b6e87ebb2b  WpayKer42V100.CBM" | md5sum -c -
+          ls -l
+
+      - name: Fetch RetroArch frontend
         run: |
           git clone --depth 1 --recurse-submodules -b v1.22.2 https://github.com/EmulatorJS/RetroArch.git RetroArch
-          git clone --depth 1 https://github.com/AloysHF/NicaiEmu.git nicaiemu
 
       - name: Patch nicaiemu for emscripten
         run: |
@@ -169,7 +199,16 @@ jobs:
           printf '%s' '{"name":"nicaiemu","extensions":["cbe"],"options":{},"save":"srm","license":"LICENSE","repo":"https://github.com/AloysHF/NicaiEmu"}' > core.json
           printf '%s' '{"minimumEJSVersion":"4.2.2","version":"0.1.0"}' > build.json
           mkdir -p out
-          printf '%s' '{"core":"nicaiemu","buildStart":"ci","buildEnd":"ci","options":{"defaultWebGL2":true}}' > out/nicaiemu-report.json
+          # ⚠️⚠️ buildStart 是「核心缓存失效的唯一开关」：EmulatorJS 把核心存进 IndexedDB
+          #   （EmulatorJS-core/core），命中条件是 `cached.version === report.buildStart`。
+          #   原来这里写死 "ci" → 换核后版本号没变 → **所有老用户永远用旧核**（2026-09-20 踩过：
+          #   WebView<95 上「无法开始游戏」修完仍复现，就是这条）。必须每次构建都不同。
+          BUILD_ID=$(date -u +%Y-%m-%dT%H:%M:%S+00:00)
+          printf '%s' "{\"core\":\"nicaiemu\",\"buildStart\":\"${BUILD_ID}\",\"buildEnd\":\"${BUILD_ID}\",\"options\":{\"defaultWebGL2\":true}}" > out/nicaiemu-report.json
+          # 站点真正请求的路径是 data/cores/reports/<core>.json，这里按同名一并产出，免得安装时漏拷
+          mkdir -p out/reports
+          cp out/nicaiemu-report.json out/reports/nicaiemu.json
+          echo "core buildStart   : ${BUILD_ID}" | tee -a build-info.txt
           cp core.json build.json out-normal/
           cp core.json build.json out-legacy/
           ( cd out-normal && 7z a -t7z ../out/nicaiemu-wasm.data nicaiemu_libretro.wasm nicaiemu_libretro.js core.json build.json )
@@ -186,4 +225,5 @@ jobs:
             RetroArch/emulatorjs/out/nicaiemu-wasm.data
             RetroArch/emulatorjs/out/nicaiemu-legacy-wasm.data
             RetroArch/emulatorjs/out/nicaiemu-report.json
+            RetroArch/emulatorjs/out/reports/nicaiemu.json
             RetroArch/emulatorjs/out/build-info.txt
