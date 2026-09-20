@@ -49,7 +49,15 @@ impl VirtualFileSystem {
         let readable = mode.starts_with('r') || mode.contains('+');
         let writable = mode.starts_with('w') || mode.starts_with('a') || mode.contains('+');
         if mode.starts_with('r') && !self.files.contains_key(&path) {
-            return -1;
+            // 内置「同目录依赖文件」兜底：原机里这些文件是跟游戏**放在同一个目录**的，
+            // 线上核没有这个目录，所以内置一份（目前是付费组件 WpayKer*.CBM）。
+            // 见 crate::builtin_files。
+            match crate::builtin_files::builtin_file(&path) {
+                Some(data) => {
+                    self.files.insert(path.clone(), data.to_vec());
+                }
+                None => return -1,
+            }
         }
         if mode.starts_with('w') {
             self.files.insert(path.clone(), Vec::new());
@@ -140,13 +148,19 @@ impl VirtualFileSystem {
     }
 
     pub(crate) fn file_exists(&self, path: &str) -> bool {
-        normalize_path(path).is_some_and(|path| self.files.contains_key(&path))
+        normalize_path(path).is_some_and(|path| {
+            self.files.contains_key(&path)
+                || crate::builtin_files::builtin_file(&path).is_some()
+        })
     }
 
     /// Read an entire file by path without allocating a handle.
     pub(crate) fn read_file(&self, path: &str) -> Option<Vec<u8>> {
         let path = normalize_path(path)?;
-        self.files.get(&path).cloned()
+        self.files
+            .get(&path)
+            .cloned()
+            .or_else(|| crate::builtin_files::builtin_file(&path).map(|data| data.to_vec()))
     }
 
     #[cfg(test)]
@@ -267,5 +281,39 @@ mod tests {
         let mut fs = VirtualFileSystem::default();
         assert_eq!(fs.open("../outside", "w", 0), -1);
         assert!(!fs.create_directory("../../outside"));
+    }
+
+    #[test]
+    fn serves_built_in_component_files_by_prefix() {
+        let mut fs = VirtualFileSystem::default();
+        // 原机里游戏就是这么要的：同目录、按名字（名字明文写在 .CBE 里）
+        assert!(fs.file_exists("WpayKer42V100.CBM"));
+        let handle = fs.open("WpayKer42V100.CBM", "r", 0);
+        assert!(handle >= 0);
+        assert_eq!(fs.size(handle as u32), Some(75341));
+        assert_eq!(
+            fs.read(handle as u32, 4).unwrap(),
+            vec![0xfe, 0xfe, 0xfe, 0xfe]
+        );
+        assert_eq!(fs.close(handle as u32), 0);
+
+        // 同一份内容的另一个名字（原机目录里两个名字 md5 相同）也要命中
+        assert!(fs.file_exists("WpayKer42WqvgaV100.CBM"));
+        // 带目录前缀也不影响
+        assert!(fs.file_exists("MB_W_QVGA\\WpayKer42V100.CBM"));
+
+        // ⚠️ 原机目录里**没有**的文件不能被凭空造出来 ——
+        //    「不存在」和「存在但是空的」对游戏是两种分支。
+        assert!(!fs.file_exists("upinfo2.dat"));
+        assert_eq!(fs.open("upinfo2.dat", "r", 0), -1);
+        assert_eq!(fs.read_file("helpinfo.dat"), None);
+    }
+
+    #[test]
+    fn built_in_component_is_read_only_when_opened_for_reading() {
+        let mut fs = VirtualFileSystem::default();
+        let handle = fs.open("wpayker42v100.cbm", "r", 0);
+        assert!(handle >= 0);
+        assert_eq!(fs.write(handle as u32, &[1, 2]), None);
     }
 }
