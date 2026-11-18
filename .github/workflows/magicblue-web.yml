@@ -1,0 +1,79 @@
+name: Magicblue CBE web core
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [integration/magicblue-web]
+    paths:
+      - 'crates/coolbaremu-core/**'
+      - 'crates/coolbaremu-libretro/**'
+      - 'Cargo.toml'
+      - 'scripts/**'
+      - '.github/workflows/magicblue-web.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-09-10
+          targets: wasm32-unknown-emscripten
+          components: rust-src
+      - uses: mymindstorm/setup-emsdk@v16
+        with:
+          version: 3.1.74
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: swatinem/rust-cache@v2
+        with:
+          key: magicblue-coolbar-web
+      - name: Packaging tools (runner only)
+        run: sudo apt-get update && sudo apt-get install -y p7zip-full zip
+      - name: Test core
+        run: cargo test -p coolbaremu-core -p coolbaremu-libretro --lib --release
+      - name: Build no-EH WASM core
+        run: cargo build -p coolbaremu-libretro --target wasm32-unknown-emscripten --profile wasm-release -Zbuild-std=std,panic_abort
+      - name: Package official runtime variants
+        run: scripts/build-emulatorjs-core.sh --work-dir "$RUNNER_TEMP/coolbar-emulatorjs"
+      - name: Add web input bridge and version metadata
+        run: python3 scripts/magicblue-package.py out/coolbaremu-emulatorjs.zip out/magicblue --source "$GITHUB_SHA"
+      - name: Verify WASM without exception handling
+        run: |
+          npm install --prefix "$RUNNER_TEMP/wabtcheck" --no-audit --no-fund wabt
+          node - "$RUNNER_TEMP/wabtcheck/node_modules/wabt" <<'JS'
+          const fs = require('node:fs');
+          require(process.argv[2])().then(wabt => {
+            for (const variant of ['normal', 'legacy']) {
+              const file = `out/magicblue/bridge-work/${variant}/coolbaremu_libretro.wasm`;
+              const m = wabt.readWasm(new Uint8Array(fs.readFileSync(file)), {readDebugNames:false, exceptions:false});
+              m.validate({exceptions:false});
+              const text = m.toText({foldExprs:false});
+              if (text.split('\n').some(line => /^\s*\(?(try|catch|catch_all|throw|rethrow|delegate|try_table|throw_ref)(\s|\)|$)/.test(line))) {
+                throw new Error(`Exception opcode found: ${variant}`);
+              }
+              m.destroy();
+              console.log(`${variant}: valid WASM, no exception opcodes`);
+            }
+          }).catch(e => { console.error(e); process.exitCode = 1; });
+          JS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: magicblue-coolbaremu
+          path: |
+            out/magicblue/magicblue-coolbaremu.zip
+            out/magicblue/core-build.json
+          if-no-files-found: error
+      - name: Publish preview package (no games, no site deployment)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if ! gh release view magicblue-web-preview --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create magicblue-web-preview --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease --title "Magicblue CBE web preview" --notes "Web core only. No game files. Source commit is recorded in core-build.json."
+          fi
+          gh release upload magicblue-web-preview out/magicblue/magicblue-coolbaremu.zip out/magicblue/core-build.json --repo "$GITHUB_REPOSITORY" --clobber
